@@ -1,5 +1,12 @@
 import gql from 'graphql-tag';
-import { Kind, graphql } from 'graphql';
+import {
+  Kind,
+  graphql,
+  DocumentNode,
+  GraphQLAbstractType,
+  GraphQLObjectType,
+} from 'graphql';
+import { makeExecutableSchema } from 'apollo-server';
 import { buildFederatedSchema } from '../buildFederatedSchema';
 import { typeSerializer } from '../../snapshotSerializers';
 
@@ -420,6 +427,59 @@ extend type User @key(fields: "email") {
   reviews: [Review]
 }
 `);
+    });
+  });
+
+  fdescribe('the isTypeOf bug', () => {
+    it('demonstrates the bug', () => {
+      const animals = [{ id: 1, name: 'Doggy' }];
+
+      const typeDefs: DocumentNode = gql`
+        union Animal = Dog
+
+        type Dog {
+          id: ID!
+          name: String!
+        }
+
+        type Query {
+          animals: [Animal]
+        }
+      `;
+
+      const resolvers = {
+        Animal: {
+          __resolveType: obj => {
+            return 'Dog';
+          },
+        },
+        Dog: {
+          __isTypeOf: animal => {
+            return true;
+          },
+        },
+        Query: { animals: () => animals },
+      };
+
+      // Build a federated version of the schema, grab interface and concrete types for comparison
+      const federated = buildFederatedSchema([{ typeDefs, resolvers }]);
+      const federatedAnimal = federated.getType(
+        'Animal',
+      ) as GraphQLAbstractType;
+      const federatedDog = federated.getType('Dog') as GraphQLObjectType;
+
+      // Build a standard version of the schema, grab interface and concrete types for compare
+      const standard = makeExecutableSchema({
+        typeDefs,
+        resolvers,
+      });
+      const standardAnimal = standard.getType('Animal') as GraphQLAbstractType;
+      const standardDog = standard.getType('Dog') as GraphQLObjectType;
+
+      expect(federatedAnimal.resolveType).toBeDefined();
+      expect(federatedDog.isTypeOf).toBeDefined();
+      expect(standardAnimal.resolveType).toBeDefined();
+      expect(standardDog.isTypeOf).toBeDefined();
     });
   });
 });
