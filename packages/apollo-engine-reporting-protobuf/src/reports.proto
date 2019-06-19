@@ -109,6 +109,40 @@ message Trace {
 		reserved 4;
 	}
 
+  // FIXME: document all new fields
+  message QueryPlanNode {
+    message SequenceNode {
+      repeated QueryPlanNode nodes = 1;
+    }
+    message ParallelNode {
+      repeated QueryPlanNode nodes = 1;
+    }
+    message FetchNode {
+      string serviceName = 1;
+      string selectionSet = 2;
+      // FIXME: do we want selectionSet to be structured instead of a string?
+      // FIXME: do we need variableUsages?
+      // FIXME: do we need requires?
+      Node root = 3;
+    }
+    message FlattenNode {
+      repeated ResponsePathElement response_path = 1;
+      QueryPlanNode node = 2;
+    }
+    message ResponsePathElement {
+      oneof id {
+			string field_name = 1;
+			uint32 index = 2;
+      }
+    }
+    oneof node {
+      SequenceNode sequence = 1;
+      ParallelNode parallel = 2;
+      FetchNode fetch = 3;
+      FlattenNode flatten = 4;
+    }
+  }
+
 	// Wallclock time when the trace began.
 	google.protobuf.Timestamp start_time = 4; // required
 	// Wallclock time when the trace ended.
@@ -156,6 +190,8 @@ message Trace {
 	CachePolicy cache_policy = 18;
 
 	Node root = 14;
+
+  QueryPlanNode query_plan = 26;
 
 	// Was this response served from a full query response cache?  (In that case
 	// the node tree will have no resolvers.)
