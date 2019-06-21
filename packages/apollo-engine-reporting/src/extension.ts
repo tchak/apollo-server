@@ -2,8 +2,6 @@ import { Request, WithRequired } from 'apollo-server-env';
 
 import {
   GraphQLResolveInfo,
-  responsePathAsArray,
-  ResponsePath,
   DocumentNode,
   ExecutionArgs,
   GraphQLError,
@@ -16,6 +14,7 @@ import {
   GenerateClientInfo,
   AddTraceArgs,
 } from './agent';
+import { EngineReportingTreeBuilder } from './treeBuilder';
 import { GraphQLRequestContext } from 'apollo-server-core/dist/requestPipelineAPI';
 
 const clientNameHeaderKey = 'apollographql-client-name';
@@ -44,8 +43,7 @@ type GraphQLErrorOrMaskedErrorObject =
 export class EngineReportingExtension<TContext = any>
   implements GraphQLExtension<TContext> {
   public trace = new Trace();
-  private nodes = new Map<string, Trace.Node>();
-  private startHrTime!: [number, number];
+  private treeBuilder = new EngineReportingTreeBuilder();
   private explicitOperationName?: string | null;
   private queryString?: string;
   private documentAST?: DocumentNode;
@@ -61,9 +59,6 @@ export class EngineReportingExtension<TContext = any>
       ...options,
     };
     this.addTrace = addTrace;
-    const root = new Trace.Node();
-    this.trace.root = root;
-    this.nodes.set(responsePathAsString(undefined), root);
     this.generateClientInfo =
       options.generateClientInfo || defaultGenerateClientInfo;
   }
@@ -81,7 +76,7 @@ export class EngineReportingExtension<TContext = any>
     >;
   }): EndHandler {
     this.trace.startTime = dateToTimestamp(new Date());
-    this.startHrTime = process.hrtime();
+    this.treeBuilder.startTiming();
 
     // Generally, we'll get queryString here and not parsedQuery; we only get
     // parsedQuery if you're using an OperationStore. In normal cases we'll get
@@ -191,9 +186,9 @@ export class EngineReportingExtension<TContext = any>
     }
 
     return () => {
-      this.trace.durationNs = durationHrTimeToNanos(
-        process.hrtime(this.startHrTime),
-      );
+      const { durationNs, rootNode } = this.treeBuilder.stopTiming();
+      this.trace.durationNs = durationNs;
+      this.trace.root = rootNode;
       this.trace.endTime = dateToTimestamp(new Date());
 
       this.trace.fullQueryCacheHit = !!o.requestContext.metrics
@@ -246,17 +241,10 @@ export class EngineReportingExtension<TContext = any>
     _context: TContext,
     info: GraphQLResolveInfo,
   ): ((error: Error | null, result: any) => void) | void {
-    const path = info.path;
-    const node = this.newNode(path);
-    node.type = info.returnType.toString();
-    node.parentType = info.parentType.toString();
-    node.startTime = durationHrTimeToNanos(process.hrtime(this.startHrTime));
-
-    return () => {
-      node.endTime = durationHrTimeToNanos(process.hrtime(this.startHrTime));
-      // We could save the error into the trace here, but it won't have all
-      // the information that graphql-js adds to it later, like 'locations'.
-    };
+    return this.treeBuilder.willResolveField(info);
+    // We could save the error into the trace during the end handler, but it
+    // won't have all the information that graphql-js adds to it later, like
+    // 'locations'.
   }
 
   public didEncounterErrors(errors: GraphQLError[]) {
@@ -341,16 +329,8 @@ export class EngineReportingExtension<TContext = any>
   }
 
   private addError(error: GraphQLErrorOrMaskedErrorObject): void {
-    // By default, put errors on the root node.
-    let node = this.nodes.get('');
-    if (error.path) {
-      const specificNode = this.nodes.get(error.path.join('.'));
-      if (specificNode) {
-        node = specificNode;
-      }
-    }
-
-    node!.error!.push(
+    this.treeBuilder.addError(
+      error.path,
       new Trace.Error({
         message: error.message,
         location: (error.locations || []).map(
@@ -360,43 +340,9 @@ export class EngineReportingExtension<TContext = any>
       }),
     );
   }
-
-  private newNode(path: ResponsePath): Trace.Node {
-    const node = new Trace.Node();
-    const id = path.key;
-    if (typeof id === 'number') {
-      node.index = id;
-    } else {
-      node.fieldName = id;
-    }
-    this.nodes.set(responsePathAsString(path), node);
-    const parentNode = this.ensureParentNode(path);
-    parentNode.child.push(node);
-    return node;
-  }
-
-  private ensureParentNode(path: ResponsePath): Trace.Node {
-    const parentPath = responsePathAsString(path.prev);
-    const parentNode = this.nodes.get(parentPath);
-    if (parentNode) {
-      return parentNode;
-    }
-    // Because we set up the root path in the constructor, we now know that
-    // path.prev isn't undefined.
-    return this.newNode(path.prev!);
-  }
 }
 
 // Helpers for producing traces.
-
-// Convert from the linked-list ResponsePath format to a dot-joined
-// string. Includes the full path (field names and array indices).
-function responsePathAsString(p: ResponsePath | undefined) {
-  if (p === undefined) {
-    return '';
-  }
-  return responsePathAsArray(p).join('.');
-}
 
 // Converts a JS Date into a Timestamp.
 function dateToTimestamp(date: Date): google.protobuf.Timestamp {
@@ -406,24 +352,6 @@ function dateToTimestamp(date: Date): google.protobuf.Timestamp {
     seconds: (totalMillis - millis) / 1000,
     nanos: millis * 1e6,
   });
-}
-
-// Converts an hrtime array (as returned from process.hrtime) to nanoseconds.
-//
-// ONLY CALL THIS ON VALUES REPRESENTING DELTAS, NOT ON THE RAW RETURN VALUE
-// FROM process.hrtime() WITH NO ARGUMENTS.
-//
-// The entire point of the hrtime data structure is that the JavaScript Number
-// type can't represent all int64 values without loss of precision:
-// Number.MAX_SAFE_INTEGER nanoseconds is about 104 days. Calling this function
-// on a duration that represents a value less than 104 days is fine. Calling
-// this function on an absolute time (which is generally roughly time since
-// system boot) is not a good idea.
-//
-// XXX We should probably use google.protobuf.Duration on the wire instead of
-// ever trying to store durations in a single number.
-function durationHrTimeToNanos(hrtime: [number, number]) {
-  return hrtime[0] * 1e9 + hrtime[1];
 }
 
 function defaultGenerateClientInfo({ request }: GraphQLRequestContext) {
